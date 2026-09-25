@@ -313,15 +313,25 @@ class OllamaEngine:
         self.timeout = timeout
         self.num_predict = num_predict
 
-    def propose(self, segments: list["architecture.Segment"], weak: dict | None = None
-                 ) -> list["architecture.FieldProposal"]:
+    def propose(self, segments: list["architecture.Segment"], weak: dict | None = None,
+                 collection_id: str = "unknown") -> list["architecture.FieldProposal"]:
         user = (f"TEXT SEGMENTS:\n{render_segments(segments)}\n\n"
                 f"PRE-FILL HINT (verify, do not trust blindly):\n{render_hint(weak)}")
         t0 = time.time()
         raw = call_ollama(SYSTEM_PROMPT, user, self.model, self.base_url,
                            timeout=self.timeout, num_predict=self.num_predict)
         print(f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
-        items = parse_claude_response(raw)
+        try:
+            items = parse_claude_response(raw)
+        except (ValueError, json.JSONDecodeError) as e:
+            # Save the raw text so we can see WHY parsing failed instead of
+            # just losing it -- this is the single most useful debugging
+            # signal when a local model doesn't follow the JSON contract.
+            debug_dir = Path("data/debug_failed_responses")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            debug_path = debug_dir / f"{collection_id}.txt"
+            debug_path.write_text(raw, encoding="utf-8")
+            raise ValueError(f"{e} (raw response saved to {debug_path})") from e
         proposals = verify_grounding(items, segments)
         return default_fill_proposals(proposals)
 
@@ -508,7 +518,7 @@ def main():
 
             print(f"[{i + 1}] {cid} ...", file=sys.stderr)
             try:
-                proposals = engine.propose(segments, weak.get(cid))
+                proposals = engine.propose(segments, weak.get(cid), collection_id=cid)
             except (ValueError, json.JSONDecodeError, requests.RequestException) as e:
                 rej_fh.write(json.dumps({"collection_id": cid, "reason": f"engine_error: {e}"}) + "\n")
                 n_rejected += 1

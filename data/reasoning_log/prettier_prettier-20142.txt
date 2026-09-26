@@ -1,0 +1,5 @@
+[reasoning_type_role]
+The issue is about preserving newline around Chinese/Japanese characters in Markdown, which is a UI/Settings change. The role is Frontend as it involves the settings page.
+
+[reasoning_experience_complexity]
+The issue is about a UI setting and doesn't require deep system knowledge, so it's not Advanced. The change is small and self-contained, so it's Low complexity.

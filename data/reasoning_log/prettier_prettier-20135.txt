@@ -1,0 +1,5 @@
+[reasoning_type_role]
+The title mentions a regression and the body describes a change in Prettier's behavior, so it's a Bug. The issue is about a code formatter, so it's a Backend issue.
+
+[reasoning_experience_complexity]
+The issue is about a code formatter, which is a well-understood and well-documented area, so it's not Advanced. The change is specific to Prettier's internal logic, which is not a deep design decision, so it's not Intermediate either. It's a specific bug fix, so it's not Beginner.

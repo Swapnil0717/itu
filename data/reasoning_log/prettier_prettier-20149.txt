@@ -1,0 +1,5 @@
+[reasoning_type_role]
+Title/body mention upgrading MDX parser, which is a new feature. The body also mentions support for directives, which is a new capability. The role is unclear from the text alone, as it could be either Frontend or Fullstack.
+
+[reasoning_experience_complexity]
+No real signal about the complexity or experience level from the text alone.

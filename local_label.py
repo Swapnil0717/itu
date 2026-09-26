@@ -134,9 +134,47 @@ defaults for any you skip):
   {"type": "blocks"|"blocked_by"|"relates_to"|"requires", "ref": "...",
   "description": "..."})
 
+EXAMPLE -- follow this shape EXACTLY. Given:
+  [S1] (ISSUE_TITLE) Add dark mode toggle to settings page
+  [S2] (ISSUE_BODY) Users want a dark mode option, a simple UI toggle in
+  Settings that switches the app theme. No backend changes needed.
+
+Correct output (every field gets its OWN object like this -- never merge
+fields into one flat {"task_type": "...", "role": "..."} object):
+[
+  {"field": "task_type", "value": "Feature", "source": "EXPLICIT",
+   "pointers": ["S1"], "evidence_text": "Add dark mode toggle to settings page",
+   "confidence": 0.9},
+  {"field": "role", "value": "Frontend", "source": "EXPLICIT",
+   "pointers": ["S2"], "evidence_text": "a simple UI toggle in Settings that switches the app theme",
+   "confidence": 0.85},
+  {"field": "experience_level", "value": "Unknown", "source": "UNKNOWN",
+   "pointers": [], "evidence_text": null, "confidence": null},
+  {"field": "complexity", "value": "Low", "source": "INFERRED",
+   "pointers": ["S2"], "evidence_text": "No backend changes needed",
+   "confidence": 0.6}
+  ... (title, summary, objective, expected_outcome, acceptance_criteria,
+  scope follow the same one-object-per-field shape; include every
+  required field this way, every time)
+]
+
 A pre-fill hint from a cheap heuristic may be given below. Treat it as a
 suggestion only -- verify against the actual segment text and override or
-discard it if it's wrong. Output the JSON array now."""
+discard it if it's wrong. Output the JSON array now, in the exact shape
+shown in the example above -- never as a flat {field: value} object."""
+
+# Appended to the user prompt on a retry after a flat/malformed first
+# response -- names the mistake and repeats the required shape inline so
+# the model doesn't need to re-read the full system prompt to self-correct.
+_CORRECTIVE_NUDGE = """
+
+Your previous answer did not follow the required format -- it looked like \
+a flat {"task_type": "...", "role": "...", ...} object instead of a JSON \
+array of per-field objects. This is a hard requirement, not a style \
+preference. Redo it now as an array where EVERY field is its own object: \
+{"field": "...", "value": ..., "source": "EXPLICIT"|"SUPPORTED_BY_CONTEXT"|"INFERRED"|"UNKNOWN", \
+"pointers": [...], "evidence_text": "..."|null, "confidence": <0-1>|null}. \
+Output ONLY the JSON array, nothing else."""
 
 
 # ------------------------------------------------------- Ollama API client
@@ -267,11 +305,39 @@ def _flat_dict_to_proposals(data: dict, anchor_pointers: list[str]) -> list[dict
       than an invented one -- verify_grounding()'s verbatim-substring
       check will (correctly) find it doesn't match the segment text and
       leaves the claim as INFERRED with confidence clamped, which is
-      exactly the outcome wanted here. The note flags it for spot-check."""
+      exactly the outcome wanted here. The note flags it for spot-check.
+
+    A response after the corrective retry (see propose()) can come back
+    HALF-converted -- some fields still bare values, others already
+    wrapped as {"value": ..., "source": ..., ...} envelopes because the
+    model partially followed the nudge. itu1/schema.py's own enum check
+    does `value not in allowed_set`, which raises TypeError (not a clean
+    validation error) if value is an unhashable dict -- so any such
+    envelope-shaped value is unwrapped to its inner "value" here rather
+    than passed through raw. Anything still not a plain string/list/dict
+    -scope-shape after that is dropped rather than risk the same crash
+    downstream -- losing one field's guess is fine, crashing the whole
+    batch on issue N is not."""
     disclosure = "unverified: recovered from a flat (non-grounded) model response, no per-field evidence given"
     proposals = []
     for k, v in data.items():
         if k not in _KNOWN_FIELDS or v is None:
+            continue
+        if isinstance(v, dict) and "value" in v and any(
+                key in v for key in ("source", "confidence", "evidence_text", "pointers")):
+            # Half-converted: the model wrapped THIS field correctly on
+            # its own -- unwrap rather than nesting the envelope as if it
+            # were the raw value.
+            v = v["value"]
+        if k in CLASSIFICATION_FIELDS and not isinstance(v, str):
+            # A classification field (task_type/role/experience_level/
+            # complexity) MUST be a plain string for schema.py's enum
+            # check to work at all -- anything else (list, dict, number)
+            # would crash _check_task_structure with an unhashable-type
+            # TypeError rather than a normal validation error. Drop it;
+            # the caller's default_fill_proposals() will fill Unknown.
+            continue
+        if k == "scope" and not isinstance(v, dict):
             continue
         proposals.append({
             "field": k, "value": v, "source": "INFERRED",
@@ -281,20 +347,34 @@ def _flat_dict_to_proposals(data: dict, anchor_pointers: list[str]) -> list[dict
     return proposals
 
 
+def _parse_raw_json(text: str) -> dict | list:
+    """Parse-only, no flat-recovery and no shape decisions -- lets the
+    caller inspect what the model actually returned (e.g. to decide
+    whether a retry is worth it) before any lossy recovery happens.
+    Raises ValueError/json.JSONDecodeError on unparseable output."""
+    text = _strip_fences(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(_extract_json_array(text))
+
+
+def _is_flat_response(data) -> bool:
+    return isinstance(data, dict) and any(k in _KNOWN_FIELDS for k in data.keys())
+
+
 def parse_claude_response(text: str, anchor_pointers: list[str] | None = None) -> list[dict]:
     """Raises ValueError on unparseable output -- caller treats as a reject.
 
     anchor_pointers: segment_ids to attach to any flat-recovered proposal
     (see _flat_dict_to_proposals); pass the issue's title/body segment ids.
+    This is the LAST-RESORT path (after OllamaEngine.propose's retry has
+    already failed to get a properly-shaped response) -- it still recovers
+    a flat response rather than losing it, same as before.
     """
-    text = _strip_fences(text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        data = json.loads(_extract_json_array(text))
+    data = _parse_raw_json(text)
     if isinstance(data, dict):
-        looks_flat = any(k in _KNOWN_FIELDS for k in data.keys())
-        if looks_flat:
+        if _is_flat_response(data):
             # {"task_type": "Feature", "role": "Backend", ...} -- the flat
             # failure mode described above. Checked before the wrapper case
             # below because a flat response can itself contain list-valued
@@ -379,11 +459,45 @@ class OllamaEngine:
                  collection_id: str = "unknown") -> list["architecture.FieldProposal"]:
         user = (f"TEXT SEGMENTS:\n{render_segments(segments)}\n\n"
                 f"PRE-FILL HINT (verify, do not trust blindly):\n{render_hint(weak)}")
+        anchor_pointers = [s.segment_id for s in segments if s.type in ("ISSUE_TITLE", "ISSUE_BODY")]
+
         t0 = time.time()
         raw = call_ollama(SYSTEM_PROMPT, user, self.model, self.base_url,
                            timeout=self.timeout, num_predict=self.num_predict)
-        print(f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
-        anchor_pointers = [s.segment_id for s in segments if s.type in ("ISSUE_TITLE", "ISSUE_BODY")]
+        elapsed = time.time() - t0
+
+        data = None
+        try:
+            data = _parse_raw_json(raw)
+        except (ValueError, json.JSONDecodeError):
+            pass  # unparseable is also worth retrying, same as a flat response
+
+        if data is None or _is_flat_response(data):
+            # First attempt gave the wrong shape (flat dict, or nothing
+            # parseable at all) -- one retry with a corrective nudge fixes
+            # this often enough with qwen2.5:3b-instruct to be worth the
+            # extra call, rather than silently accepting an ungrounded
+            # record on every single issue.
+            reason = "flat response" if data is not None else "unparseable response"
+            print(f"  {reason} on attempt 1 -- retrying with corrective nudge", file=sys.stderr)
+            t1 = time.time()
+            raw_retry = call_ollama(SYSTEM_PROMPT, user + _CORRECTIVE_NUDGE, self.model,
+                                     self.base_url, timeout=self.timeout, num_predict=self.num_predict)
+            elapsed += time.time() - t1
+            try:
+                data_retry = _parse_raw_json(raw_retry)
+            except (ValueError, json.JSONDecodeError):
+                data_retry = None
+            if isinstance(data_retry, list) or (isinstance(data_retry, dict) and not _is_flat_response(data_retry)):
+                # Retry produced a properly-shaped (or wrapper-shaped)
+                # response -- use it instead of the flat/failed first one.
+                raw = raw_retry
+                print("  retry recovered a properly-shaped response", file=sys.stderr)
+            else:
+                print("  retry did not fix it -- falling back to flat-recovery", file=sys.stderr)
+
+        print(f"  ({elapsed:.1f}s)", file=sys.stderr)
+
         try:
             items = parse_claude_response(raw, anchor_pointers)
         except (ValueError, json.JSONDecodeError) as e:
@@ -587,16 +701,41 @@ def main():
                 n_rejected += 1
                 continue
 
-            ground_truth, trace = architecture.assemble(task_identity, proposals, segments)
+            ground_truth, trace = None, None
+            try:
+                ground_truth, trace = architecture.assemble(task_identity, proposals, segments)
+            except Exception as e:
+                # Defense in depth on top of the sanitizing in
+                # _flat_dict_to_proposals: itu1/schema.py's enum check
+                # (`value not in allowed_set`) raises TypeError instead of
+                # a clean validation error on some malformed shapes, and
+                # itu1/ is intentionally left unmodified (it's the tested
+                # source of truth), so it can't be hardened directly here.
+                # Losing one issue to an unexpected shape is fine; losing
+                # the rest of the batch after it (and the compute already
+                # spent on this one) is not.
+                rej_fh.write(json.dumps({"collection_id": cid,
+                                          "reason": f"assemble_crashed: {type(e).__name__}: {e}"}) + "\n")
+                n_rejected += 1
+                continue
             if isinstance(ground_truth, architecture.RejectedResult):
                 rej_fh.write(json.dumps({"collection_id": cid, "reason_codes": ground_truth.reason_codes,
                                           "detail": ground_truth.detail}) + "\n")
                 n_rejected += 1
                 continue
 
-            lic = record_license(rec, args.license)
-            ex = build_training_example(rec, ground_truth, lic, model_label)
-            errors = example_mod.validate_example(ex)
+            try:
+                lic = record_license(rec, args.license)
+                ex = build_training_example(rec, ground_truth, lic, model_label)
+                errors = example_mod.validate_example(ex)
+            except Exception as e:
+                # Same defense-in-depth rationale as the assemble() guard
+                # above -- an unexpected shape here shouldn't cost the
+                # rest of the batch either.
+                rej_fh.write(json.dumps({"collection_id": cid,
+                                          "reason": f"build_or_validate_crashed: {type(e).__name__}: {e}"}) + "\n")
+                n_rejected += 1
+                continue
             if errors:
                 rej_fh.write(json.dumps({"collection_id": cid, "reason": "invalid_training_example",
                                           "errors": errors}) + "\n")

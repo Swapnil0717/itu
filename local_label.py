@@ -339,6 +339,20 @@ def _flat_dict_to_proposals(data: dict, anchor_pointers: list[str]) -> list[dict
             continue
         if k == "scope" and not isinstance(v, dict):
             continue
+        if k in LIST_FIELDS or k == "acceptance_criteria":
+            # schema.py requires a list of strings here (_is_str_list) --
+            # and for acceptance_criteria specifically, an empty list also
+            # trips Rule 5 ("acceptance_criteria is empty but classification
+            # succeeded"), so a dropped value fails just as hard as a bad
+            # one. A bare string is the model's most common mistake for
+            # these fields; coerce it to a one-item list instead of losing
+            # it. Anything else malformed (dict, number, list containing
+            # non-strings) still gets dropped -- Unknown/[] downstream is
+            # safer than guessing at a shape.
+            if isinstance(v, str):
+                v = [v]
+            elif not (isinstance(v, list) and all(isinstance(i, str) for i in v)):
+                continue
         proposals.append({
             "field": k, "value": v, "source": "INFERRED",
             "pointers": list(anchor_pointers), "evidence_text": disclosure, "confidence": 0.3,
@@ -363,6 +377,39 @@ def _is_flat_response(data) -> bool:
     return isinstance(data, dict) and any(k in _KNOWN_FIELDS for k in data.keys())
 
 
+def _is_single_proposal(data) -> bool:
+    return isinstance(data, dict) and "field" in data and "value" in data
+
+
+REQUIRED_FIELD_NAMES = {
+    "task_type", "role", "experience_level", "complexity", "title",
+    "summary", "objective", "expected_outcome", "acceptance_criteria", "scope",
+}
+# SYSTEM_PROMPT asks for these 10 fields "every time" (UNKNOWN + a default
+# value when there's no signal, but never omitted). A response that covers
+# fewer than this many has the model giving up partway through -- whether
+# that shows up as a flat dict, unparseable text, or (the case that slipped
+# through silently before this check existed) one lone well-formed proposal
+# object with no array wrapper around it. All three are worth one corrective
+# retry, same rationale the flat/unparseable cases already used.
+MIN_REQUIRED_FIELDS_TO_ACCEPT = 5
+
+
+def _covered_required_fields(data) -> set:
+    """Cheap, best-effort count of which of the 10 always-required fields a
+    freshly-parsed (not yet normalized) response addresses -- used only to
+    decide whether a retry is worth it. parse_claude_response() below is
+    still the sole authority on the final, normalized proposal list."""
+    if isinstance(data, dict):
+        if _is_single_proposal(data):
+            field = data.get("field")
+            return {field} if field in REQUIRED_FIELD_NAMES else set()
+        return set(data.keys()) & REQUIRED_FIELD_NAMES
+    if isinstance(data, list):
+        return {item.get("field") for item in data if isinstance(item, dict)} & REQUIRED_FIELD_NAMES
+    return set()
+
+
 def parse_claude_response(text: str, anchor_pointers: list[str] | None = None) -> list[dict]:
     """Raises ValueError on unparseable output -- caller treats as a reject.
 
@@ -381,6 +428,18 @@ def parse_claude_response(text: str, anchor_pointers: list[str] | None = None) -
             # keys (e.g. "acceptance_criteria": [...]), which would
             # otherwise be mistaken for the single-list-key wrapper.
             data = _flat_dict_to_proposals(data, anchor_pointers or [])
+        elif _is_single_proposal(data):
+            # The model gave up after proposing exactly ONE field but got
+            # that proposal's own shape right -- {"field": "task_type",
+            # "value": ..., "source": ..., "pointers": [...], ...} -- and
+            # simply forgot to wrap it in a JSON array. Checked before the
+            # generic wrapper-key heuristic below: that heuristic scans the
+            # dict's own values for a list and would grab THIS object's
+            # "pointers" (itself a list) as if it were the wrapped array,
+            # turning a real, well-grounded proposal into a bare segment-id
+            # string that verify_grounding() then silently drops -- an
+            # observed cause of otherwise-inexplicable Level-4 abstains.
+            data = [data]
         else:
             # Some local models wrap the array, e.g. {"proposals": [...]}
             list_vals = [v for v in data.values() if isinstance(v, list)]
@@ -454,6 +513,17 @@ class OllamaEngine:
         self.base_url = base_url
         self.timeout = timeout
         self.num_predict = num_predict
+        # Set on every propose() call so the caller can log *why* a record
+        # ended up abstained (Level 4) without a parse exception ever being
+        # raised -- e.g. a properly-shaped response where every item came
+        # back source="UNKNOWN" or with pointers that don't resolve. Without
+        # this, a Level-4 abstain is a silent black box: nothing gets
+        # written to debug_failed_responses (that path only fires on a
+        # parse *exception*, not on a parse that succeeds but yields
+        # nothing usable).
+        self.last_raw: str = ""
+        self.last_shape: str = ""
+        self.last_n_items: int = 0
 
     def propose(self, segments: list["architecture.Segment"], weak: dict | None = None,
                  collection_id: str = "unknown") -> list["architecture.FieldProposal"]:
@@ -472,14 +542,27 @@ class OllamaEngine:
         except (ValueError, json.JSONDecodeError):
             pass  # unparseable is also worth retrying, same as a flat response
 
-        if data is None or _is_flat_response(data):
-            # First attempt gave the wrong shape (flat dict, or nothing
-            # parseable at all) -- one retry with a corrective nudge fixes
-            # this often enough with qwen2.5:3b-instruct to be worth the
-            # extra call, rather than silently accepting an ungrounded
-            # record on every single issue.
-            reason = "flat response" if data is not None else "unparseable response"
+        coverage = _covered_required_fields(data) if data is not None else set()
+        sparse = (data is not None and not _is_flat_response(data)
+                  and len(coverage) < MIN_REQUIRED_FIELDS_TO_ACCEPT)
+
+        shape_label = "list"
+        if data is None or _is_flat_response(data) or sparse:
+            # First attempt gave the wrong shape (flat dict, nothing
+            # parseable, or -- the case a plain shape-check misses -- a
+            # syntactically fine response that only ever proposed a
+            # handful of the 10 required fields). One retry with a
+            # corrective nudge fixes this often enough with
+            # qwen2.5:3b-instruct to be worth the extra call, rather than
+            # silently accepting an ungrounded record on every issue.
+            if data is None:
+                reason = "unparseable response"
+            elif _is_flat_response(data):
+                reason = "flat response"
+            else:
+                reason = f"sparse response ({len(coverage)}/{len(REQUIRED_FIELD_NAMES)} required fields present)"
             print(f"  {reason} on attempt 1 -- retrying with corrective nudge", file=sys.stderr)
+
             t1 = time.time()
             raw_retry = call_ollama(SYSTEM_PROMPT, user + _CORRECTIVE_NUDGE, self.model,
                                      self.base_url, timeout=self.timeout, num_predict=self.num_predict)
@@ -488,13 +571,23 @@ class OllamaEngine:
                 data_retry = _parse_raw_json(raw_retry)
             except (ValueError, json.JSONDecodeError):
                 data_retry = None
-            if isinstance(data_retry, list) or (isinstance(data_retry, dict) and not _is_flat_response(data_retry)):
-                # Retry produced a properly-shaped (or wrapper-shaped)
-                # response -- use it instead of the flat/failed first one.
+
+            coverage_retry = _covered_required_fields(data_retry) if data_retry is not None else set()
+            retry_is_better = (data_retry is not None and not _is_flat_response(data_retry)
+                                and len(coverage_retry) > len(coverage))
+
+            if retry_is_better:
                 raw = raw_retry
-                print("  retry recovered a properly-shaped response", file=sys.stderr)
-            else:
+                shape_label = "retry-recovered"
+                print(f"  retry recovered {len(coverage_retry)}/{len(REQUIRED_FIELD_NAMES)} "
+                      "required fields -- using it instead", file=sys.stderr)
+            elif data is None or _is_flat_response(data):
                 print("  retry did not fix it -- falling back to flat-recovery", file=sys.stderr)
+                shape_label = "flat-recovered"
+            else:
+                print(f"  retry did not improve on the original ({len(coverage)}/"
+                      f"{len(REQUIRED_FIELD_NAMES)} required fields) -- keeping it", file=sys.stderr)
+                shape_label = "sparse-kept"
 
         print(f"  ({elapsed:.1f}s)", file=sys.stderr)
 
@@ -509,6 +602,11 @@ class OllamaEngine:
             debug_path = debug_dir / f"{collection_id}.txt"
             debug_path.write_text(raw, encoding="utf-8")
             raise ValueError(f"{e} (raw response saved to {debug_path})") from e
+
+        self.last_raw = raw
+        self.last_n_items = len(items) if isinstance(items, list) else 0
+        self.last_shape = shape_label
+
         proposals = verify_grounding(items, segments)
         return default_fill_proposals(proposals)
 
@@ -653,6 +751,13 @@ def main():
     ap.add_argument("--license", default="MIT", help="fallback if a record's own data_provenance.license is missing")
     ap.add_argument("--limit", type=int, default=None, help="label at most N issues (testing)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--resume", action="store_true",
+                     help="skip collection_ids already present in --out or --rejects-out, and "
+                          "append instead of overwriting them. Use this for any run long enough "
+                          "to risk being interrupted (a full-corpus pass on modest hardware can "
+                          "take many hours) -- without it, a crash or closed terminal loses "
+                          "every issue labeled so far, since --out is normally rewritten fresh "
+                          "on each run.")
     ap.add_argument("--apply-corrections", default=None,
                      help="path to a corrections.jsonl; if given, all other labeling is skipped")
     args = ap.parse_args()
@@ -680,14 +785,41 @@ def main():
     for p in (out_path, spot_path, rej_path):
         p.parent.mkdir(parents=True, exist_ok=True)
 
+    already_done = set()
+    file_mode = "w"
+    if args.resume:
+        file_mode = "a"
+        # Both --out (successes/abstains) and --rejects-out (hard failures)
+        # represent an issue that's been dispositioned -- either counts as
+        # "done" and should be skipped on resume, or a re-run would relabel
+        # (and re-spend the 150-600s/issue compute cost) work already banked.
+        for p in (out_path, rej_path):
+            if p.exists():
+                with p.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        cid = row.get("collection_id")
+                        if cid:
+                            already_done.add(cid)
+        print(f"--resume: {len(already_done)} issue(s) already dispositioned -- skipping them",
+              file=sys.stderr)
+
     n_written = n_rejected = n_spot = 0
-    with out_path.open("w", encoding="utf-8") as out_fh, \
-         spot_path.open("w", encoding="utf-8") as spot_fh, \
-         rej_path.open("w", encoding="utf-8") as rej_fh:
+    with out_path.open(file_mode, encoding="utf-8") as out_fh, \
+         spot_path.open(file_mode, encoding="utf-8") as spot_fh, \
+         rej_path.open(file_mode, encoding="utf-8") as rej_fh:
 
         for i, cid in enumerate(iter_batched_records(records_by_id, Path(args.batches))):
             if args.limit and i >= args.limit:
                 break
+            if cid in already_done:
+                continue
             rec = records_by_id[cid]
             inp = to_inference_input(rec)
             task_identity = architecture._task_identity(inp)
@@ -724,6 +856,23 @@ def main():
                 n_rejected += 1
                 continue
 
+            if getattr(trace, "degradation_level", 0) == 4:
+                # A Level-4 abstain is schema-valid (all-Unknown), so it's
+                # written to --out like a normal example, not --rejects-out
+                # -- meaning nothing else in this script explains WHY it
+                # abstained. Log it separately so that's diagnosable instead
+                # of a silent "Unable to determine task from this issue".
+                abstain_dir = Path("data/abstain_debug")
+                abstain_dir.mkdir(parents=True, exist_ok=True)
+                (abstain_dir / f"{cid}.json").write_text(json.dumps({
+                    "collection_id": cid,
+                    "response_shape": engine.last_shape,
+                    "n_proposal_items": engine.last_n_items,
+                    "trace_repairs": trace.repairs,
+                    "trace_downgrades": trace.downgrades,
+                    "raw_model_response": engine.last_raw,
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+
             try:
                 lic = record_license(rec, args.license)
                 ex = build_training_example(rec, ground_truth, lic, model_label)
@@ -758,7 +907,11 @@ def main():
                 }, ensure_ascii=False) + "\n")
                 n_spot += 1
 
-    print(f"\nwritten: {n_written}  rejected: {n_rejected}  flagged for spot-check: {n_spot}")
+    session_label = "this session" if args.resume else "total"
+    print(f"\n{session_label}: written {n_written}  rejected {n_rejected}  flagged for spot-check {n_spot}")
+    if args.resume:
+        print(f"cumulative (including prior sessions): "
+              f"{len(already_done) + n_written + n_rejected} of {len(records_by_id)} issues dispositioned")
     print(f"-> {out_path}\n-> {spot_path}\n-> {rej_path}")
     if n_written:
         reject_rate = n_rejected / (n_written + n_rejected)

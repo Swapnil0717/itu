@@ -232,18 +232,80 @@ def _extract_json_array(text: str) -> str:
     return text
 
 
-def parse_claude_response(text: str) -> list[dict]:
-    """Raises ValueError on unparseable output -- caller treats as a reject."""
+# Top-level field names the SYSTEM_PROMPT asks for. Used only to recognize
+# the flat-map failure mode below -- not a schema check.
+_KNOWN_FIELDS = {
+    "task_type", "role", "experience_level", "complexity", "title", "summary",
+    "objective", "expected_outcome", "acceptance_criteria", "scope",
+    "technologies", "languages", "frameworks", "technical_areas", "components",
+    "systems", "affected_areas", "dependencies",
+}
+
+
+def _flat_dict_to_proposals(data: dict, anchor_pointers: list[str]) -> list[dict]:
+    """Recover a flat {field: value} response into proposal-shaped dicts.
+
+    A known small-model failure mode: the model answers the labeling
+    question correctly but can't hold the nested per-field envelope
+    (source/pointers/evidence_text/confidence) in its head at the same
+    time, so it emits plain {"task_type": "Feature", ...} instead of the
+    array of proposal objects the grounding pipeline expects. Rather than
+    discard genuinely useful values, recover them here -- but honestly:
+    source is forced to INFERRED and confidence is fixed low.
+
+    Two things every INFERRED claim needs downstream, and why they're
+    filled the way they are instead of left empty:
+    - a *resolvable* pointer, or architecture.assemble()'s H2.6 check
+      downgrades the claim straight to UNKNOWN and the value is lost
+      again anyway. Each proposal is pointed at the issue's own
+      title/body segments -- the same "whole issue, no exact quote"
+      grounding the heuristic engine already uses for its own INFERRED
+      complexity/experience_level guesses in architecture.py.
+    - a non-empty evidence_text string, or schema rule 3 (INFERRED
+      requires evidence) rejects the record. Since there's no real quote
+      to give, evidence_text is a fixed, honest disclosure string rather
+      than an invented one -- verify_grounding()'s verbatim-substring
+      check will (correctly) find it doesn't match the segment text and
+      leaves the claim as INFERRED with confidence clamped, which is
+      exactly the outcome wanted here. The note flags it for spot-check."""
+    disclosure = "unverified: recovered from a flat (non-grounded) model response, no per-field evidence given"
+    proposals = []
+    for k, v in data.items():
+        if k not in _KNOWN_FIELDS or v is None:
+            continue
+        proposals.append({
+            "field": k, "value": v, "source": "INFERRED",
+            "pointers": list(anchor_pointers), "evidence_text": disclosure, "confidence": 0.3,
+            "note": "recovered from flat (non-grounded) model response",
+        })
+    return proposals
+
+
+def parse_claude_response(text: str, anchor_pointers: list[str] | None = None) -> list[dict]:
+    """Raises ValueError on unparseable output -- caller treats as a reject.
+
+    anchor_pointers: segment_ids to attach to any flat-recovered proposal
+    (see _flat_dict_to_proposals); pass the issue's title/body segment ids.
+    """
     text = _strip_fences(text)
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         data = json.loads(_extract_json_array(text))
     if isinstance(data, dict):
-        # Some local models wrap the array, e.g. {"proposals": [...]}
-        list_vals = [v for v in data.values() if isinstance(v, list)]
-        if len(list_vals) == 1:
-            data = list_vals[0]
+        looks_flat = any(k in _KNOWN_FIELDS for k in data.keys())
+        if looks_flat:
+            # {"task_type": "Feature", "role": "Backend", ...} -- the flat
+            # failure mode described above. Checked before the wrapper case
+            # below because a flat response can itself contain list-valued
+            # keys (e.g. "acceptance_criteria": [...]), which would
+            # otherwise be mistaken for the single-list-key wrapper.
+            data = _flat_dict_to_proposals(data, anchor_pointers or [])
+        else:
+            # Some local models wrap the array, e.g. {"proposals": [...]}
+            list_vals = [v for v in data.values() if isinstance(v, list)]
+            if len(list_vals) == 1:
+                data = list_vals[0]
     if not isinstance(data, list):
         raise ValueError("expected a JSON array of proposals")
     return data
@@ -321,8 +383,9 @@ class OllamaEngine:
         raw = call_ollama(SYSTEM_PROMPT, user, self.model, self.base_url,
                            timeout=self.timeout, num_predict=self.num_predict)
         print(f"  ({time.time() - t0:.1f}s)", file=sys.stderr)
+        anchor_pointers = [s.segment_id for s in segments if s.type in ("ISSUE_TITLE", "ISSUE_BODY")]
         try:
-            items = parse_claude_response(raw)
+            items = parse_claude_response(raw, anchor_pointers)
         except (ValueError, json.JSONDecodeError) as e:
             # Save the raw text so we can see WHY parsing failed instead of
             # just losing it -- this is the single most useful debugging
